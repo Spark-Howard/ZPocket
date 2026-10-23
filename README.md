@@ -3,6 +3,11 @@
 把 ZCode 桌面客户端官方的「手机连接远程操控」装进一个原生安卓 APP：
 不用再打开手机浏览器，点开图标 → 扫码 → 直接在手机上操控/监督电脑端的 ZCode 干活。
 
+## 下载安装
+
+从 [Releases](https://github.com/Spark-Howard/ZPocket/releases) 下载最新 APK
+直接安装（Android 8.0+，允许未知来源后覆盖安装会保留登录态和连接历史）。
+
 ## 工作原理
 
 ZCode 官方手机远程是**云端中继**架构：电脑端和手机各自连到 `zcode.z.ai` 的 WebSocket
