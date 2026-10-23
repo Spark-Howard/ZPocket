@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ZPocket" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/zpocket_background</item>
+        <item name="android:statusBarColor">@color/zpocket_background</item>
+        <item name="android:navigationBarColor">@color/zpocket_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <!-- 退出沉浸式（edge-to-edge）：WebView 内容不画到系统栏底下，
+             三键导航不遮挡网页底部按钮，也避开 Android 15 WebView 误拉输入法的问题 -->
+        <item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>
+    </style>
+</resources>
