@@ -32,10 +32,11 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
         history = store.load()
     }
 
-    fun connect(url: String) {
-        val conn = store.record(url) ?: return
+    fun connect(url: String): Boolean {
+        val conn = store.record(url) ?: return false
         refresh()
         screen = Screen.Remote(conn)
+        return true
     }
 
     LaunchedEffect(incomingUrl.value) {

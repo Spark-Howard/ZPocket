@@ -21,15 +21,22 @@ object QrDecoder {
     /**
      * 依次尝试四个方向解码；全部失败再用反色重试一遍四个方向
      * （桌面端深色主题下二维码可能是白码黑底的反色码）。
-     * 解码成功返回内容，失败返回 null。
+     *
+     * @param preRotations 已知的预旋转次数（逆时针 90° 步进），来自相机帧的方向信息，
+     *   让第一次尝试就是正确方向，避免每帧都从原始方向盲试。
+     * @return 解码成功返回内容，失败返回 null。
      *
      * 注意：旋转必须作用在 LuminanceSource 上再二值化 ——
      * HybridBinarizer 生成的 BinaryBitmap 不支持旋转（会抛 UnsupportedOperationException）。
      */
-    fun decode(source: LuminanceSource): String? {
-        var result = tryAllOrientations(source)
+    fun decode(source: LuminanceSource, preRotations: Int = 0): String? {
+        var s = source
+        repeat(preRotations) { s = rotateCounterClockwise(s) }
+        var result = tryAllOrientations(s)
         if (result == null) {
-            result = tryAllOrientations(InvertedLuminanceSource(source))
+            var inverted: LuminanceSource = InvertedLuminanceSource(source)
+            repeat(preRotations) { inverted = rotateCounterClockwise(inverted) }
+            result = tryAllOrientations(inverted)
         }
         return result
     }

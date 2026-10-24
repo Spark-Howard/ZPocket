@@ -6,23 +6,36 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Message
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.JsPromptResult
+import android.webkit.JsResult
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.URLUtil
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -34,6 +47,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -45,6 +59,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,6 +67,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -74,7 +90,27 @@ fun RemoteScreen(
 
     val initialHost = remember(connection.url) { Uri.parse(connection.url).host.orEmpty() }
 
-    val webView = remember(connection.url) {
+    // 主框架加载失败时显示原生重试页（DNS/服务器错误等）
+    var loadError by remember(connection.url) { mutableStateOf<String?>(null) }
+    // WebView 渲染进程崩溃后重建计数
+    var webViewGeneration by remember(connection.url) { mutableIntStateOf(0) }
+
+    // 网页文件上传（<input type=file>）：把选择结果回传给页面
+    var pendingFileChooser by remember {
+        mutableStateOf<ValueCallback<Array<Uri>>?>(null)
+    }
+    val fileChooserLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val callback = pendingFileChooser
+        pendingFileChooser = null
+        callback?.onReceiveValue(
+            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                ?: arrayOf()
+        )
+    }
+
+    val webView = remember(connection.url, webViewGeneration) {
         WebView(context).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -103,7 +139,13 @@ fun RemoteScreen(
             // 交给系统下载管理器（带上登录 Cookie），旧机型没权限时跳系统浏览器
             setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
                 runCatching {
-                    if (url.startsWith("http")) {
+                    if (url.startsWith("blob:")) {
+                        Toast.makeText(
+                            context,
+                            "网页动态生成的文件暂不支持在 APP 内下载",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    } else if (url.startsWith("http")) {
                         val dm = context.getSystemService(DownloadManager::class.java)
                         val canDownload = dm != null && (Build.VERSION.SDK_INT >= 29 ||
                             ContextCompat.checkSelfPermission(
@@ -163,8 +205,40 @@ fun RemoteScreen(
                     }
                 }
 
+                override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                    loadError = null
+                }
+
                 override fun onPageFinished(view: WebView, url: String?) {
                     CookieManager.getInstance().flush()
+                }
+
+                // 主框架加载失败（DNS/断网等）：显示原生重试页，替代难看的系统错误页
+                override fun onReceivedError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    error: WebResourceError,
+                ) {
+                    if (request.isForMainFrame) {
+                        loadError = error.description?.toString() ?: "网页加载失败"
+                    }
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    errorResponse: WebResourceResponse,
+                ) {
+                    if (request.isForMainFrame && errorResponse.statusCode >= 400) {
+                        loadError = "服务器错误（HTTP ${errorResponse.statusCode}）"
+                    }
+                }
+
+                // 渲染进程崩溃：销毁并重建 WebView，而不是留一个永远黑屏的页面
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    webViewGeneration += 1
+                    loadError = "页面渲染进程异常退出，请重试"
+                    return true
                 }
             }
             webChromeClient = object : WebChromeClient() {
@@ -174,6 +248,80 @@ fun RemoteScreen(
 
                 override fun onPermissionRequest(request: PermissionRequest?) {
                     request?.deny()
+                }
+
+                // 网页 alert/confirm/prompt：WebView 默认会静默忽略，这里用原生对话框实现
+                override fun onJsAlert(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    result: JsResult?,
+                ): Boolean {
+                    android.app.AlertDialog.Builder(context)
+                        .setMessage(message)
+                        .setPositiveButton("确定") { _, _ -> result?.confirm() }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                }
+
+                override fun onJsConfirm(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    result: JsResult?,
+                ): Boolean {
+                    android.app.AlertDialog.Builder(context)
+                        .setMessage(message)
+                        .setPositiveButton("确定") { _, _ -> result?.confirm() }
+                        .setNegativeButton("取消") { _, _ -> result?.cancel() }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                }
+
+                override fun onJsPrompt(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    defaultValue: String?,
+                    result: JsPromptResult?,
+                ): Boolean {
+                    val input = EditText(context)
+                    input.setText(defaultValue)
+                    android.app.AlertDialog.Builder(context)
+                        .setMessage(message)
+                        .setView(input)
+                        .setPositiveButton("确定") { _, _ ->
+                            result?.confirm(input.text.toString())
+                        }
+                        .setNegativeButton("取消") { _, _ -> result?.cancel() }
+                        .setOnCancelListener { result?.cancel() }
+                        .show()
+                    return true
+                }
+
+                // 网页文件上传（如从手机传文件给 ZCode）
+                override fun onShowFileChooser(
+                    webView: WebView?,
+                    filePathCallback: ValueCallback<Array<Uri>>?,
+                    fileChooserParams: FileChooserParams?,
+                ): Boolean {
+                    val callback = filePathCallback ?: return false
+                    val intent = fileChooserParams?.createIntent()
+                    if (intent == null) {
+                        callback.onReceiveValue(null)
+                        return true
+                    }
+                    pendingFileChooser?.onReceiveValue(null)
+                    pendingFileChooser = callback
+                    runCatching {
+                        fileChooserLauncher.launch(intent)
+                    }.onFailure {
+                        pendingFileChooser = null
+                        callback.onReceiveValue(null)
+                    }
+                    return true
                 }
 
                 // target=_blank / window.open 的新窗口：站内链接在当前 WebView 打开，外链跳系统浏览器
@@ -288,11 +436,14 @@ fun RemoteScreen(
             }
 
             Box(Modifier.weight(1f).fillMaxWidth()) {
-                AndroidView(
-                    factory = { webView },
-                    modifier = Modifier.fillMaxSize(),
-                    onRelease = { it.destroy() },
-                )
+                // key 变化（渲染进程崩溃后）时强制重建 AndroidView，换上新的 WebView 实例
+                key(webViewGeneration) {
+                    AndroidView(
+                        factory = { webView },
+                        modifier = Modifier.fillMaxSize(),
+                        onRelease = { it.destroy() },
+                    )
+                }
                 if (progress in 1..99) {
                     LinearProgressIndicator(
                         progress = { progress / 100f },
@@ -300,6 +451,42 @@ fun RemoteScreen(
                         color = MaterialTheme.colorScheme.primary,
                         trackColor = MaterialTheme.colorScheme.surfaceVariant,
                     )
+                }
+                loadError?.let { message ->
+                    Column(
+                        Modifier
+                            .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.background)
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text("无法加载页面", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "请检查电脑端 ZCode 是否在线、手机网络是否可用",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.outline,
+                            textAlign = TextAlign.Center,
+                        )
+                        Spacer(Modifier.height(28.dp))
+                        Button(onClick = {
+                            loadError = null
+                            webView.reload()
+                        }) {
+                            Text("重试")
+                        }
+                        TextButton(onClick = onBack) {
+                            Text("返回主页", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
                 }
             }
         }

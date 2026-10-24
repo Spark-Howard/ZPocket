@@ -67,6 +67,34 @@ class QrDecoderTest {
     }
 
     @Test
+    fun decodesWithPreRotation() {
+        // 已知帧方向时先预旋转（3 次逆时针 == 1 次顺时针），首次尝试即应解出
+        val (lum, w, h) = luminanceOf(qrUrl, invertColors = false)
+        val rotated = ByteArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                rotated[x * h + (h - 1 - y)] = lum[y * w + x]
+            }
+        }
+        val source = PlanarYUVLuminanceSource(rotated, h, w, 0, 0, h, w, false)
+        assertEquals(qrUrl, QrDecoder.decode(source, preRotations = 3))
+    }
+
+    @Test
+    fun decodesInvertedWithPreRotation() {
+        // 反色 + 方向不符的组合也要能解出
+        val (lum, w, h) = luminanceOf(qrUrl, invertColors = true)
+        val rotated = ByteArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                rotated[x * h + (h - 1 - y)] = lum[y * w + x]
+            }
+        }
+        val source = PlanarYUVLuminanceSource(rotated, h, w, 0, 0, h, w, false)
+        assertEquals(qrUrl, QrDecoder.decode(source, preRotations = 3))
+    }
+
+    @Test
     fun returnsNullForBlankImage() {
         val lum = ByteArray(100 * 100) { 255.toByte() }
         assertNull(decode(lum, 100, 100))

@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.google.zxing.PlanarYUVLuminanceSource
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -77,7 +78,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 @Composable
-fun ScannerScreen(onBack: () -> Unit, onScanned: (String) -> Unit) {
+fun ScannerScreen(onBack: () -> Unit, onScanned: (String) -> Boolean) {
     val context = LocalContext.current
     BackHandler(onBack = onBack)
 
@@ -107,7 +108,11 @@ fun ScannerScreen(onBack: () -> Unit, onScanned: (String) -> Unit) {
         if (text.startsWith("http://") || text.startsWith("https://")) {
             if (connecting.compareAndSet(false, true)) {
                 vibrate(context)
-                onScanned(text)
+                if (!onScanned(text)) {
+                    // 链接格式有效但无法建立连接记录：允许继续扫下一个
+                    connecting.set(false)
+                    Toast.makeText(context, "该链接无法建立连接", Toast.LENGTH_SHORT).show()
+                }
             }
         } else {
             // 识别到了但不是链接：明确告诉用户内容是什么，而不是无声失败
@@ -254,6 +259,8 @@ private fun CameraScanner(torchOn: Boolean, onResult: (String) -> Unit, modifier
 
     LaunchedEffect(Unit) {
         val p = cameraProvider(context)
+        // 离开扫码页后才拿到 provider 的情况：不再绑定相机，避免摄像头常开
+        coroutineContext.ensureActive()
         provider = p
         val preview = Preview.Builder()
             .build()
@@ -340,7 +347,14 @@ private class QrAnalyzer(private val onResult: (String) -> Unit) : ImageAnalysis
                 }
 
             val source = PlanarYUVLuminanceSource(luminance, width, height, 0, 0, width, height, false)
-            QrDecoder.decode(source)?.let(onResult)
+            // 先按相机报告的方向转正（clockwise(rotation) == counterclockwise(360-rotation)）
+            val preRotations = when (image.imageInfo.rotationDegrees) {
+                90 -> 3
+                180 -> 2
+                270 -> 1
+                else -> 0
+            }
+            QrDecoder.decode(source, preRotations)?.let(onResult)
         } catch (_: Exception) {
             // 个别帧数据异常，直接丢弃
         } finally {
