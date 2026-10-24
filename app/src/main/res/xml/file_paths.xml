@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- DownloadManager 公共下载目录（应用内更新 APK 所在位置） -->
+    <external-path
+        name="downloads"
+        path="Download/" />
+</paths>

@@ -28,6 +28,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -49,7 +50,10 @@ import java.util.Locale
 fun HomeScreen(
     history: List<Connection>,
     autoConnect: Boolean,
+    currentVersion: String,
+    checkingUpdate: Boolean,
     onAutoConnectChange: (Boolean) -> Unit,
+    onCheckUpdate: () -> Unit,
     onScan: () -> Unit,
     onOpen: (Connection) -> Unit,
     onDelete: (Connection) -> Unit,
@@ -104,6 +108,25 @@ fun HomeScreen(
                     )
                 }
                 Switch(checked = autoConnect, onCheckedChange = onAutoConnectChange)
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("检查更新", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "当前版本 v$currentVersion · 有新版会在启动时提醒",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = onCheckUpdate, enabled = !checkingUpdate) {
+                    Text(if (checkingUpdate) "检查中…" else "检查")
+                }
             }
 
             Spacer(Modifier.height(16.dp))
