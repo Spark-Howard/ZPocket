@@ -1,16 +1,24 @@
 package com.zpocket.app.ui
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.Message
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,6 +55,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import com.zpocket.app.data.Connection
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -80,6 +89,9 @@ fun RemoteScreen(
                 allowFileAccess = false
                 allowContentAccess = false
                 mediaPlaybackRequiresUserGesture = true
+                javaScriptCanOpenWindowsAutomatically = true
+                // 支持页面 window.open / target=_blank（配合下方 onCreateWindow）
+                setSupportMultipleWindows(true)
                 // 去掉 WebView 标记，伪装成 Chrome，避免被站点检测拦截
                 userAgentString = userAgentString
                     .replace("; wv", "")
@@ -87,6 +99,46 @@ fun RemoteScreen(
             }
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            // 文件下载：WebView 默认不处理下载，会表现为"一直加载但看不到"；
+            // 交给系统下载管理器（带上登录 Cookie），旧机型没权限时跳系统浏览器
+            setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                runCatching {
+                    if (url.startsWith("http")) {
+                        val dm = context.getSystemService(DownloadManager::class.java)
+                        val canDownload = dm != null && (Build.VERSION.SDK_INT >= 29 ||
+                            ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                            ) == PackageManager.PERMISSION_GRANTED)
+                        if (dm != null && canDownload) {
+                            val name = URLUtil.guessFileName(url, contentDisposition, mimeType)
+                            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                                setNotificationVisibility(
+                                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                                )
+                                CookieManager.getInstance().getCookie(url)?.let {
+                                    addRequestHeader("Cookie", it)
+                                }
+                                addRequestHeader("User-Agent", userAgent)
+                                setDestinationInExternalPublicDir(
+                                    Environment.DIRECTORY_DOWNLOADS,
+                                    name,
+                                )
+                                if (!mimeType.isNullOrBlank()) setMimeType(mimeType)
+                            }
+                            dm.enqueue(request)
+                            Toast.makeText(context, "开始下载：$name", Toast.LENGTH_SHORT).show()
+                        } else {
+                            openExternal(context, Uri.parse(url))
+                            Toast.makeText(context, "已转交系统浏览器下载", Toast.LENGTH_SHORT).show()
+                        }
+                    } else {
+                        openExternal(context, Uri.parse(url))
+                    }
+                }.onFailure {
+                    Toast.makeText(context, "下载失败：${it.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(
                     view: WebView,
@@ -122,6 +174,40 @@ fun RemoteScreen(
 
                 override fun onPermissionRequest(request: PermissionRequest?) {
                     request?.deny()
+                }
+
+                // target=_blank / window.open 的新窗口：站内链接在当前 WebView 打开，外链跳系统浏览器
+                override fun onCreateWindow(
+                    view: WebView,
+                    isDialog: Boolean,
+                    isUserGesture: Boolean,
+                    resultMsg: Message,
+                ): Boolean {
+                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                    val temp = WebView(view.context)
+                    temp.webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            v: WebView,
+                            request: WebResourceRequest,
+                        ): Boolean {
+                            val url = request.url
+                            val host = url.host.orEmpty()
+                            if (url.scheme == "http" || url.scheme == "https") {
+                                if (host == initialHost || host.endsWith(".z.ai")) {
+                                    this@apply.loadUrl(url.toString())
+                                } else {
+                                    openExternal(context, url)
+                                }
+                            } else {
+                                openExternal(context, url)
+                            }
+                            v.post { temp.destroy() }
+                            return true
+                        }
+                    }
+                    transport.webView = temp
+                    resultMsg.sendToTarget()
+                    return true
                 }
             }
             loadUrl(connection.url)
