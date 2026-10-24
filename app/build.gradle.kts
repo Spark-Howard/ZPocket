@@ -12,8 +12,8 @@ android {
         applicationId = "com.zpocket.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.2.0"
+        versionCode = 12
+        versionName = "1.2.4"
     }
 
     signingConfigs {

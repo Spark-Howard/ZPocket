@@ -3,6 +3,8 @@ package com.zpocket.app.ui
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -73,6 +75,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.zpocket.app.data.Connection
+import org.json.JSONObject
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -94,6 +97,8 @@ fun RemoteScreen(
     var loadError by remember(connection.url) { mutableStateOf<String?>(null) }
     // WebView 渲染进程崩溃后重建计数
     var webViewGeneration by remember(connection.url) { mutableIntStateOf(0) }
+    // 诊断报告（菜单"复制诊断信息"生成）
+    var diagReport by remember { mutableStateOf<String?>(null) }
 
     // 网页文件上传（<input type=file>）：把选择结果回传给页面
     var pendingFileChooser by remember {
@@ -128,6 +133,8 @@ fun RemoteScreen(
                 javaScriptCanOpenWindowsAutomatically = true
                 // 支持页面 window.open / target=_blank（配合下方 onCreateWindow）
                 setSupportMultipleWindows(true)
+                // 固定 100%：系统"大字体"缩放会让窄容器一行只放一个字（竖排效果）
+                textZoom = 100
                 // 去掉 WebView 标记，伪装成 Chrome，避免被站点检测拦截
                 userAgentString = userAgentString
                     .replace("; wv", "")
@@ -211,6 +218,12 @@ fun RemoteScreen(
 
                 override fun onPageFinished(view: WebView, url: String?) {
                     CookieManager.getInstance().flush()
+                    injectCompatCss(view)
+                }
+
+                // SPA 路由切换也会触发，保证注入始终存在
+                override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                    injectCompatCss(view)
                 }
 
                 // 主框架加载失败（DNS/断网等）：显示原生重试页，替代难看的系统错误页
@@ -410,6 +423,22 @@ fun RemoteScreen(
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("在浏览器中打开") },
+                                onClick = {
+                                    menuOpen = false
+                                    webView.url?.let {
+                                        openExternal(context, Uri.parse(it))
+                                    }
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("复制诊断信息") },
+                                onClick = {
+                                    menuOpen = false
+                                    collectDiagnostics(webView) { diagReport = it }
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("重新扫码") },
                                 onClick = {
                                     menuOpen = false
@@ -536,7 +565,137 @@ fun RemoteScreen(
             },
         )
     }
+
+    diagReport?.let { report ->
+        AlertDialog(
+            onDismissRequest = { diagReport = null },
+            title = { Text("诊断信息") },
+            text = {
+                Text(
+                    report,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                        ClipData.newPlainText("zpocket-diag", report)
+                    )
+                    Toast.makeText(context, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                }) { Text("复制") }
+            },
+            dismissButton = {
+                TextButton(onClick = { diagReport = null }) { Text("关闭") }
+            },
+        )
+    }
 }
+
+/**
+ * 官方远程页设置面板的窄屏兼容样式。
+ *
+ * 根因：设置行组件（"界面语言"等）使用
+ * `grid-cols-[minmax(0,1fr)_192px]` —— 左列自适应、右列固定 192px，
+ * 且 minmax 下限为 0。桌面端面板约 700px 宽没有问题；手机镜像面板
+ * 约 270px 宽，左列被压到一个字宽，中文呈现竖列。
+ * 这是官方页面在窄宽度下的响应式缺陷（与内核无关，浏览器同样如此）。
+ *
+ * 处理：窄视口下把该布局改为上下堆叠（与官方 wide 布局一致），
+ * 并限制 260px 宽的下拉框不溢出。仅注入一次，SPA 路由切换后仍有效。
+ *
+ * 图表类缺陷（同样只在窄宽度下出现）：
+ * - 每日 Token 趋势图硬编码 interval:0 渲染全部日期刻度，窄容器必然
+ *   重叠 → 隔一个隐藏刻度并缩小字号（图表自带 Tooltip 可查看精确值）；
+ * - 模型用量环形图 SVG 尺寸不随容器收缩 → max-width:100% 等比缩放，
+ *   容器 overflow:hidden 兜底。
+ */
+private const val COMPAT_CSS_JS = """(function(){
+  if (document.getElementById('zpocket-compat-css')) return;
+  var s = document.createElement('style');
+  s.id = 'zpocket-compat-css';
+  s.textContent = "@media (max-width:700px){" +
+    ".grid-cols-\\[minmax\\(0\\,1fr\\)_192px\\]{grid-template-columns:minmax(0,1fr)!important}" +
+    ".grid-cols-\\[minmax\\(0\\,1fr\\)_280px\\]{grid-template-columns:minmax(0,1fr)!important}" +
+    ".w-\\[260px\\]{max-width:100%}" +
+    ".recharts-surface{max-width:100%!important;height:auto!important}" +
+    "div:has(>.recharts-surface){overflow:hidden}" +
+    ".recharts-cartesian-axis-tick:nth-of-type(2n){display:none}" +
+    ".recharts-cartesian-axis-tick text{font-size:10px}" +
+    "}";
+  (document.head || document.documentElement).appendChild(s);
+})()"""
+
+private fun injectCompatCss(view: WebView) {
+    view.evaluateJavascript(COMPAT_CSS_JS, null)
+}
+
+/**
+ * 收集页面渲染诊断：扫描当前页面上"宽度过窄导致文字竖排"的元素，
+ * 连同 WebView 内核版本和视口尺寸一起返回，供排查布局问题。
+ *
+ * 使用方式：先在页面上打开出现问题的界面（如设置面板），再触发本诊断。
+ */
+private fun collectDiagnostics(webView: WebView, onReport: (String) -> Unit) {
+    webView.evaluateJavascript(DIAGNOSTIC_JS) { raw ->
+        val report = runCatching {
+            val obj = JSONObject(raw ?: return@runCatching "诊断失败：页面未返回数据")
+            val vp = obj.getJSONObject("viewport")
+            val wv = runCatching {
+                if (Build.VERSION.SDK_INT >= 26) WebView.getCurrentWebViewPackage() else null
+            }.getOrNull()
+            buildString {
+                appendLine("WebView内核: ${wv?.packageName ?: "未知"} ${wv?.versionName ?: "未知"}")
+                appendLine("视口: ${vp.optInt("w")}x${vp.optInt("h")} dpr=${vp.optDouble("dpr")}")
+                appendLine("竖排元素样本:")
+                val items = obj.optJSONArray("items")
+                if (items == null || items.length() == 0) {
+                    appendLine("（未发现明显竖排元素——请确认问题界面当前处于打开状态）")
+                } else {
+                    for (i in 0 until items.length()) {
+                        appendLine(items.optJSONObject(i)?.toString().orEmpty())
+                    }
+                }
+            }
+        }.getOrDefault("诊断失败: ${raw?.take(200)}")
+        onReport(report.take(4000))
+    }
+}
+
+private const val DIAGNOSTIC_JS = """(function() {
+  var items = [];
+  try {
+    var all = document.querySelectorAll('body *');
+    for (var i = 0; i < all.length; i++) {
+      if (items.length >= 10) break;
+      var el = all[i];
+      if (el.children && el.children.length > 0) continue;
+      var t = (el.textContent || '').trim();
+      if (t.length < 2) continue;
+      var r = el.getBoundingClientRect();
+      var cs = window.getComputedStyle(el);
+      var fs = parseFloat(cs.fontSize) || 16;
+      if (r.width > 0 && r.height > r.width * 1.8 && r.width < fs * 1.6) {
+        items.push({
+          tag: el.tagName,
+          cls: String(el.className || '').slice(0, 80),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          fontSize: Math.round(fs),
+          display: cs.display,
+          whiteSpace: cs.whiteSpace,
+          writingMode: cs.writingMode,
+          text: t.slice(0, 16)
+        });
+      }
+    }
+  } catch (e) {
+    items.push({error: String(e)});
+  }
+  return {
+    viewport: {w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio},
+    items: items
+  };
+})()"""
 
 private fun openExternal(context: Context, url: Uri) {
     runCatching {
