@@ -219,11 +219,13 @@ fun RemoteScreen(
                 override fun onPageFinished(view: WebView, url: String?) {
                     CookieManager.getInstance().flush()
                     injectCompatCss(view)
+                    injectTouchReorder(view)
                 }
 
                 // SPA 路由切换也会触发，保证注入始终存在
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                     injectCompatCss(view)
+                    injectTouchReorder(view)
                 }
 
                 // 主框架加载失败（DNS/断网等）：显示原生重试页，替代难看的系统错误页
@@ -627,6 +629,118 @@ private const val COMPAT_CSS_JS = """(function(){
 
 private fun injectCompatCss(view: WebView) {
     view.evaluateJavascript(COMPAT_CSS_JS, null)
+}
+
+/**
+ * 触摸长按拖拽排序（工作区等 dnd-kit 可排序列表）。
+ *
+ * 根因：官方远程页（remote/v4）工作区行把 dnd-kit PointerSensor 的拖拽监听
+ * 铺在整行上，靠 pointerdown 后移动 8px 激活拖拽。桌面端鼠标正常；手机上
+ * 行元素没有 touch-action:none，手指一动浏览器原生滚动就接管手势并发出
+ * pointercancel，拖拽永远无法激活 —— 所以手机端只能长按（WebView 原生
+ * contextmenu，等同桌面右键）弹菜单，无法拖动排序。
+ *
+ * 处理：注入"长按拖拽"手势 —— 按住可排序元素 280ms（短于右键菜单的 ~500ms）
+ * 后合成 pointerdown 激活页面 dnd-kit，并锁定原生滚动（touchmove
+ * preventDefault，避免 pointercancel 掐断拖拽）；之后的移动/松手事件全部
+ * 由页面原有逻辑处理，排序结果照常同步到电脑端。
+ *
+ * 与既有手势共存：
+ * - 按住不动 → 放行 contextmenu，右键菜单行为不变；
+ * - 长按生效前大幅移动 → 是滚动，不干预；
+ * - 拖动进行中到达的 contextmenu → 抑制，避免拖到一半弹菜单；
+ * - 自带 touch-action:none 的元素（如分区拖拽手柄）原生就能拖，跳过不干预。
+ *
+ * 脚本幂等（window 标记），SPA 路由切换后重复注入无副作用。
+ */
+private const val TOUCH_REORDER_JS = """(function(){
+  'use strict';
+  if (window.__zpocketTouchReorder) return;
+  if (typeof window.PointerEvent === 'undefined') return;
+  window.__zpocketTouchReorder = true;
+  var ARM_DELAY = 280, SCROLL_SLOP = 12, MENU_SLOP = 8;
+  var pending = false, armed = false, moved = 0;
+  var startX = 0, startY = 0, lastX = 0, lastY = 0;
+  var touchId = null, row = null, timer = null, prevUserSelect = '';
+  function dist(x1, y1, x2, y2) {
+    return Math.sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+  }
+  function cancelPending() {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    pending = false; touchId = null; row = null;
+  }
+  function cleanup() {
+    cancelPending();
+    armed = false; moved = 0;
+    if (document.body) document.body.style.userSelect = prevUserSelect;
+  }
+  function arm() {
+    timer = null; pending = false;
+    // 页面重渲染可能已把行节点换掉：事件发不进 React，只会白白锁住滚动
+    if (!row || !row.isConnected) { cleanup(); return; }
+    // 手指在 8~12px 间慢移再停住时，页面原生拖拽可能已被真实 pointerdown
+    // 激活（aria-pressed 是 dnd-kit 对激活项的标记）：此时不能再叠加合成
+    // 事件，否则两个 sensor 抢同一个指针
+    if (row.getAttribute('aria-pressed') === 'true') { cleanup(); return; }
+    armed = true; moved = 0;
+    prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+    try { navigator.vibrate && navigator.vibrate(10); } catch (e) {}
+    row.dispatchEvent(new PointerEvent('pointerdown', {
+      bubbles: true, cancelable: true, composed: true,
+      isPrimary: true, pointerId: 1, pointerType: 'touch',
+      button: 0, buttons: 1, clientX: lastX, clientY: lastY,
+    }));
+  }
+  document.addEventListener('touchstart', function (e) {
+    if (armed || pending) cleanup();
+    if (e.touches.length !== 1) return;
+    var t = e.touches[0];
+    var el = e.target.closest
+      ? e.target.closest('[aria-roledescription="sortable"]')
+      : null;
+    if (!el || getComputedStyle(el).touchAction === 'none') return;
+    pending = true; touchId = t.identifier;
+    startX = lastX = t.clientX; startY = lastY = t.clientY;
+    row = el;
+    timer = setTimeout(arm, ARM_DELAY);
+  }, { capture: true, passive: true });
+  document.addEventListener('touchmove', function (e) {
+    if (touchId === null) return;
+    var t = null;
+    for (var i = 0; i < e.touches.length; i++) {
+      if (e.touches[i].identifier === touchId) { t = e.touches[i]; break; }
+    }
+    if (!t) return;
+    lastX = t.clientX; lastY = t.clientY;
+    moved = dist(startX, startY, lastX, lastY);
+    if (!armed) {
+      if (moved > SCROLL_SLOP) cancelPending();
+      return;
+    }
+    e.preventDefault();
+  }, { capture: true, passive: false });
+  function onTouchEnd(e) {
+    if (touchId === null) return;
+    for (var i = 0; i < e.changedTouches.length; i++) {
+      if (e.changedTouches[i].identifier === touchId) { cleanup(); break; }
+    }
+  }
+  document.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
+  document.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: true });
+  document.addEventListener('contextmenu', function (e) {
+    if (!armed) { if (pending) cancelPending(); return; }
+    if (moved > MENU_SLOP) {
+      e.preventDefault();
+      e.stopPropagation();
+    } else {
+      cleanup();
+    }
+  }, true);
+})()"""
+
+private fun injectTouchReorder(view: WebView) {
+    view.evaluateJavascript(TOUCH_REORDER_JS, null)
 }
 
 /**
