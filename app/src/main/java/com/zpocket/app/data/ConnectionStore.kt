@@ -77,6 +77,18 @@ class ConnectionStore(context: Context) {
     fun setAutoConnectEnabled(enabled: Boolean) =
         prefs.edit().putBoolean(KEY_AUTO_CONNECT, enabled).apply()
 
+    /** 远程页期间是否用前台服务保活，切后台不掉线（默认开）。 */
+    fun isKeepAliveEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_ALIVE, true)
+
+    fun setKeepAliveEnabled(enabled: Boolean) =
+        prefs.edit().putBoolean(KEY_KEEP_ALIVE, enabled).apply()
+
+    /** 电池优化引导是否已展示过（只提示一次，无论用户是否同意）。 */
+    fun isBatteryPromptShown(): Boolean = prefs.getBoolean(KEY_BATTERY_PROMPT, false)
+
+    fun markBatteryPromptShown() =
+        prefs.edit().putBoolean(KEY_BATTERY_PROMPT, true).apply()
+
     private fun save(list: List<Connection>) {
         val array = JSONArray()
         list.forEach { c ->
@@ -94,6 +106,8 @@ class ConnectionStore(context: Context) {
     private companion object {
         const val KEY_LIST = "connections"
         const val KEY_AUTO_CONNECT = "auto_connect"
+        const val KEY_KEEP_ALIVE = "keep_alive"
+        const val KEY_BATTERY_PROMPT = "battery_prompt"
         const val MAX_ENTRIES = 20
     }
 }

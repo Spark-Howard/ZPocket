@@ -11,6 +11,14 @@
     <!-- 应用内更新：下载完成后拉起安装器（Android 8+ 需用户授予"安装未知应用"） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- 前台保活服务：远程页期间保持进程前台优先级，避免切后台冻结/查杀导致 WebSocket 断连 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 保活服务的常驻通知（Android 13+ 运行时授权；拒绝时服务照常工作，只是通知不显示） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 引导用户加入电池优化白名单（只弹系统确认框，不静默生效） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
@@ -45,6 +53,17 @@
                     android:pathPrefix="/remote" />
             </intent-filter>
         </activity>
+
+        <!-- 远程页期间的前台保活服务：随远程页启停（stopWithTask：用户划掉任务时一并结束） -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:stopWithTask="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keep the WebSocket connection to desktop ZCode alive while the remote screen is open" />
+        </service>
 
         <!-- 应用内更新：把下载好的 APK 以 content:// 形式交给系统安装器 -->
         <provider

@@ -1,8 +1,15 @@
 package com.zpocket.app.ui
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -14,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
@@ -24,6 +32,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.zpocket.app.KeepAliveService
 import com.zpocket.app.data.Connection
 import com.zpocket.app.data.ConnectionStore
 import kotlinx.coroutines.launch
@@ -45,6 +55,7 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
     var screen by remember { mutableStateOf(initialScreen(store)) }
     var history by remember { mutableStateOf(store.load()) }
     var autoConnect by remember { mutableStateOf(store.isAutoConnectEnabled()) }
+    var keepAlive by remember { mutableStateOf(store.isKeepAliveEnabled()) }
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -90,6 +101,50 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
     // 启动时静默检查一次；更新弹窗只在主页展示，不打断远程会话
     LaunchedEffect(Unit) { checkUpdate(manual = false) }
 
+    // 远程页激活期间启动前台保活服务，离开远程页/关闭开关/退出 APP 时停止。
+    // 进程保持前台优先级就不会被冻结查杀，WebSocket 心跳不中断，
+    // 切后台再回来就不会触发官方页面的重连动画和会话重新加载。
+    DisposableEffect(screen is Screen.Remote, keepAlive) {
+        val keep = screen is Screen.Remote && keepAlive
+        if (keep) KeepAliveService.start(context)
+        onDispose {
+            if (keep) KeepAliveService.stop(context)
+        }
+    }
+
+    // 首次进入远程页：请求通知权限（保活通知可见）+ 引导电池优化白名单，各只出现一次
+    var showBatteryDialog by remember { mutableStateOf(false) }
+    var promptBatteryAfterNotif by remember { mutableStateOf(false) }
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        if (promptBatteryAfterNotif) {
+            promptBatteryAfterNotif = false
+            showBatteryDialog = true
+        }
+    }
+    LaunchedEffect(screen is Screen.Remote) {
+        if (screen !is Screen.Remote) return@LaunchedEffect
+        val powerManager = context.getSystemService(PowerManager::class.java)
+        val alreadyWhitelisted =
+            powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+        val needBatteryPrompt =
+            !store.isBatteryPromptShown() && !alreadyWhitelisted
+        if (!needBatteryPrompt) return@LaunchedEffect
+        store.markBatteryPromptShown()
+        val notifGranted = Build.VERSION.SDK_INT < 33 ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+        if (notifGranted) {
+            showBatteryDialog = true
+        } else {
+            promptBatteryAfterNotif = true
+            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     LaunchedEffect(incomingUrl.value) {
         incomingUrl.value?.let {
             connect(it)
@@ -101,11 +156,16 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
         Screen.Home -> HomeScreen(
             history = history,
             autoConnect = autoConnect,
+            keepAlive = keepAlive,
             currentVersion = currentVersion,
             checkingUpdate = checking,
             onAutoConnectChange = {
                 autoConnect = it
                 store.setAutoConnectEnabled(it)
+            },
+            onKeepAliveChange = {
+                keepAlive = it
+                store.setKeepAliveEnabled(it)
             },
             onCheckUpdate = { checkUpdate(manual = true) },
             onScan = { screen = Screen.Scanner },
@@ -191,5 +251,33 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
                 },
             )
         }
+    }
+
+    // 电池优化白名单引导：切后台被系统冻结是断线重连的根因之一，白名单是前台服务之外的第二道保险
+    if (showBatteryDialog) {
+        AlertDialog(
+            onDismissRequest = { showBatteryDialog = false },
+            title = { Text("保持后台连接") },
+            text = {
+                Text(
+                    "切到其他应用或锁屏时，系统可能冻结 ZPocket 导致断线重连。" +
+                        "允许「忽略电池优化」后，短时间内切回无需重新连接，仅轻微增加耗电。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBatteryDialog = false
+                    runCatching {
+                        context.startActivity(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                                .setData(Uri.parse("package:${context.packageName}"))
+                        )
+                    }
+                }) { Text("去设置") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatteryDialog = false }) { Text("暂不") }
+            },
+        )
     }
 }

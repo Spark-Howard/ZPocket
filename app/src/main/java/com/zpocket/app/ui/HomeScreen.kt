@@ -50,9 +50,11 @@ import java.util.Locale
 fun HomeScreen(
     history: List<Connection>,
     autoConnect: Boolean,
+    keepAlive: Boolean,
     currentVersion: String,
     checkingUpdate: Boolean,
     onAutoConnectChange: (Boolean) -> Unit,
+    onKeepAliveChange: (Boolean) -> Unit,
     onCheckUpdate: () -> Unit,
     onScan: () -> Unit,
     onOpen: (Connection) -> Unit,
@@ -108,6 +110,23 @@ fun HomeScreen(
                     )
                 }
                 Switch(checked = autoConnect, onCheckedChange = onAutoConnectChange)
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("后台保持连接", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "切出去再回来不用重新连接（会常驻一条通知）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = keepAlive, onCheckedChange = onKeepAliveChange)
             }
 
             Spacer(Modifier.height(8.dp))

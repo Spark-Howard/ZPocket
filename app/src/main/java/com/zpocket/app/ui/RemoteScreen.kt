@@ -135,6 +135,8 @@ fun RemoteScreen(
                 setSupportMultipleWindows(true)
                 // 固定 100%：系统"大字体"缩放会让窄容器一行只放一个字（竖排效果）
                 textZoom = 100
+                // 切后台不降渲染进程优先级，避免后台期间渲染进程被回收、回来变成错误页
+                setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
                 // 去掉 WebView 标记，伪装成 Chrome，避免被站点检测拦截
                 userAgentString = userAgentString
                     .replace("; wv", "")
