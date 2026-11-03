@@ -83,6 +83,12 @@ class ConnectionStore(context: Context) {
     fun setKeepAliveEnabled(enabled: Boolean) =
         prefs.edit().putBoolean(KEY_KEEP_ALIVE, enabled).apply()
 
+    /** 任务状态通知是否开启：完成/等待确认/出错时弹本地提醒（默认开）。 */
+    fun isTaskNotifyEnabled(): Boolean = prefs.getBoolean(KEY_TASK_NOTIFY, true)
+
+    fun setTaskNotifyEnabled(enabled: Boolean) =
+        prefs.edit().putBoolean(KEY_TASK_NOTIFY, enabled).apply()
+
     /** 电池优化引导是否已展示过（只提示一次，无论用户是否同意）。 */
     fun isBatteryPromptShown(): Boolean = prefs.getBoolean(KEY_BATTERY_PROMPT, false)
 
@@ -107,6 +113,7 @@ class ConnectionStore(context: Context) {
         const val KEY_LIST = "connections"
         const val KEY_AUTO_CONNECT = "auto_connect"
         const val KEY_KEEP_ALIVE = "keep_alive"
+        const val KEY_TASK_NOTIFY = "task_notify"
         const val KEY_BATTERY_PROMPT = "battery_prompt"
         const val MAX_ENTRIES = 20
     }

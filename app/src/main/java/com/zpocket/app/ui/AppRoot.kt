@@ -56,6 +56,7 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
     var history by remember { mutableStateOf(store.load()) }
     var autoConnect by remember { mutableStateOf(store.isAutoConnectEnabled()) }
     var keepAlive by remember { mutableStateOf(store.isKeepAliveEnabled()) }
+    var taskNotify by remember { mutableStateOf(store.isTaskNotifyEnabled()) }
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -157,6 +158,7 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
             history = history,
             autoConnect = autoConnect,
             keepAlive = keepAlive,
+            taskNotify = taskNotify,
             currentVersion = currentVersion,
             checkingUpdate = checking,
             onAutoConnectChange = {
@@ -166,6 +168,10 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
             onKeepAliveChange = {
                 keepAlive = it
                 store.setKeepAliveEnabled(it)
+            },
+            onTaskNotifyChange = {
+                taskNotify = it
+                store.setTaskNotifyEnabled(it)
             },
             onCheckUpdate = { checkUpdate(manual = true) },
             onScan = { screen = Screen.Scanner },

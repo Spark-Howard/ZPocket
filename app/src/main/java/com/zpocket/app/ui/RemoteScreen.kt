@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Message
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
@@ -42,9 +43,12 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.MoreVert
@@ -99,6 +103,11 @@ fun RemoteScreen(
     var webViewGeneration by remember(connection.url) { mutableIntStateOf(0) }
     // 诊断报告（菜单"复制诊断信息"生成）
     var diagReport by remember { mutableStateOf<String?>(null) }
+    // 状态探测报告（菜单"复制状态探测"生成，用于调优 TASK_OBSERVER_JS 的信号）
+    var probeReport by remember { mutableStateOf<String?>(null) }
+
+    // 任务状态通知的决策状态机：与 WebView 同生命周期（重建 WebView 即重置基线）
+    val sessionAlerts = remember(connection.url, webViewGeneration) { SessionAlertPolicy() }
 
     // 网页文件上传（<input type=file>）：把选择结果回传给页面
     var pendingFileChooser by remember {
@@ -222,12 +231,14 @@ fun RemoteScreen(
                     CookieManager.getInstance().flush()
                     injectCompatCss(view)
                     injectTouchReorder(view)
+                    injectTaskObserver(view)
                 }
 
                 // SPA 路由切换也会触发，保证注入始终存在
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                     injectCompatCss(view)
                     injectTouchReorder(view)
+                    injectTaskObserver(view)
                 }
 
                 // 主框架加载失败（DNS/断网等）：显示原生重试页，替代难看的系统错误页
@@ -261,6 +272,24 @@ fun RemoteScreen(
             webChromeClient = object : WebChromeClient() {
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
                     progress = newProgress
+                }
+
+                // 任务状态观察脚本（TASK_OBSERVER_JS）经 console 上报状态迁移，
+                // 这里解析后交给 SessionNotifier 决定是否弹本地通知。
+                // 不用 addJavascriptInterface：console 桥不向页面暴露任何对象，
+                // 且 JSON 内容按不可信数据处理（解析失败静默丢弃）。
+                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                    val message = consoleMessage?.message()
+                    if (message == null || !message.startsWith(STATE_REPORT_PREFIX)) {
+                        return super.onConsoleMessage(consoleMessage)
+                    }
+                    val state = runCatching {
+                        JSONObject(message.removePrefix(STATE_REPORT_PREFIX)).optString("state")
+                    }.getOrNull()
+                    if (!state.isNullOrEmpty()) {
+                        SessionNotifier.handleStateReport(context, connection.name, sessionAlerts, state)
+                    }
+                    return true
                 }
 
                 override fun onPermissionRequest(request: PermissionRequest?) {
@@ -443,6 +472,13 @@ fun RemoteScreen(
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("复制状态探测") },
+                                onClick = {
+                                    menuOpen = false
+                                    collectStateProbe(webView) { probeReport = it }
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("重新扫码") },
                                 onClick = {
                                     menuOpen = false
@@ -590,6 +626,36 @@ fun RemoteScreen(
             },
             dismissButton = {
                 TextButton(onClick = { diagReport = null }) { Text("关闭") }
+            },
+        )
+    }
+
+    probeReport?.let { report ->
+        AlertDialog(
+            onDismissRequest = { probeReport = null },
+            title = { Text("状态探测") },
+            text = {
+                Column(
+                    Modifier
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        report,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                        ClipData.newPlainText("zpocket-probe", report)
+                    )
+                    Toast.makeText(context, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                }) { Text("复制") }
+            },
+            dismissButton = {
+                TextButton(onClick = { probeReport = null }) { Text("关闭") }
             },
         )
     }
@@ -746,6 +812,164 @@ private fun injectTouchReorder(view: WebView) {
 }
 
 /**
+ * 会话状态观察器：检测官方远程页的任务状态迁移并上报给原生侧（→ 本地通知）。
+ *
+ * 背景：官方页（remote/v4）自带会话状态机 idle/running/waiting/paused/completed/
+ * error（见其前端 bundle），但没有对外 API，状态只能从 DOM 侧观察。配对成功后的
+ * 实时 DOM 无法离线获取，因此采用「语义锚点 + 图标信号」的分层启发式：
+ * - 语义锚点：官方 CSS 里开发者命名的容器类 @container/composer（输入区）、
+ *   @container/topoverlayer（顶层状态层），类名不随构建哈希变；
+ * - 图标信号：lucide 图标以字面类名渲染（lucide-loader-circle /
+ *   lucide-triangle-alert / lucide-circle-check / lucide-square 等），同为稳定信号。
+ *
+ * 判定优先级：error（可见警告图标）> running（输入区出现停止按钮或持续转圈的
+ * loader）> completed（状态层出现对勾图标）> waiting（running 结束后输入框可用、
+ * 无结束图标 = 在等用户回复）> idle（静止）。信号全部失效时返回 unknown ——
+ * 静默不通知，不影响远程会话本身。
+ *
+ * 防误报：状态迁移需连续两次读数一致才认定（页面加载动画等瞬时信号自然过滤）；
+ * MutationObserver（400ms 防抖）保实时性，4 秒轮询兜底防漏报（切后台后定时器
+ * 仍执行，进程由保活前台服务维持）。只在状态变化时打一条
+ * `__ZPOCKET_STATE__{...}` console，由原生侧 onConsoleMessage 接收。
+ *
+ * 调优：菜单「复制状态探测」导出当前判定依据（可见图标清单、锚点容器
+ * innerHTML 片段）；官方页面改版导致识别失效时，据此修正下方信号表。
+ */
+private const val TASK_OBSERVER_JS = """(function(){
+  'use strict';
+  if (window.__zpocketTaskObserver) return;
+  window.__zpocketTaskObserver = true;
+
+  // ---- 信号表（lucide 图标字面类名，兼容新旧命名）----
+  var ERROR_ICONS = ['triangle-alert', 'circle-alert', 'octagon-alert'];
+  var STOP_ICONS = ['square', 'circle-stop', 'stop-circle', 'octagon-x'];
+  var DONE_ICONS = ['circle-check', 'check-circle', 'circle-check-big', 'badge-check'];
+  var LOADER_RE = /lucide-(loader[a-z0-9-]*)/;
+
+  function visible(el) {
+    if (!el || !el.isConnected) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  }
+  // 收集 root 下可见的 lucide 图标名
+  function collectIcons(root) {
+    var names = [];
+    try {
+      var svgs = (root || document).querySelectorAll('svg[class*="lucide-"]');
+      for (var i = 0; i < svgs.length; i++) {
+        var el = svgs[i];
+        if (!visible(el)) continue;
+        var m = String(el.getAttribute('class') || '').match(/lucide-[a-z0-9-]+/g) || [];
+        for (var j = 0; j < m.length; j++) {
+          var n = m[j].slice(7);
+          if (names.indexOf(n) < 0) names.push(n);
+        }
+      }
+    } catch (e) {}
+    return names;
+  }
+  function hasAny(names, want) {
+    for (var i = 0; i < want.length; i++) {
+      if (names.indexOf(want[i]) >= 0) return true;
+    }
+    return false;
+  }
+  // 语义容器锚点（官方 CSS 开发者命名）
+  function composer() {
+    return document.querySelector('[class*="@container/composer"]');
+  }
+  function overlay() {
+    return document.querySelector('[class*="@container/topoverlayer"]');
+  }
+  // 输入框是否可用（等待用户回复的基本特征）
+  function inputReady() {
+    var scope = composer() || document;
+    return !!scope.querySelector('textarea:not([disabled]), [contenteditable="true"]');
+  }
+  // root 内是否有"正在转圈"的 loader 图标（animate-spin 或计算样式动画名含 spin）
+  function spinning(root) {
+    if (!root) return false;
+    try {
+      var svgs = root.querySelectorAll('svg[class*="lucide-"]');
+      for (var i = 0; i < svgs.length; i++) {
+        var el = svgs[i];
+        if (!visible(el)) continue;
+        var cls = String(el.getAttribute('class') || '');
+        if (!LOADER_RE.test(cls)) continue;
+        if (cls.indexOf('animate-spin') >= 0) return true;
+        if (String(getComputedStyle(el).animationName).indexOf('spin') >= 0) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // ---- 状态判定 ----
+  var prev = 'unknown';      // 上次已上报状态
+  var candidate = 'unknown'; // 候选状态（需连续两次一致才认定）
+
+  function classify() {
+    var all = collectIcons(document);
+    if (hasAny(all, ERROR_ICONS)) return 'error';
+    var c = composer();
+    var o = overlay();
+    if (hasAny(c ? collectIcons(c) : [], STOP_ICONS)) return 'running';
+    if (spinning(c) || spinning(o)) return 'running';
+    var oIcons = o ? collectIcons(o) : [];
+    if (hasAny(oIcons, DONE_ICONS) || oIcons.indexOf('check') >= 0) return 'completed';
+    if (hasAny(all, DONE_ICONS)) return 'completed';
+    if (inputReady()) {
+      // 上一状态是 running/waiting：跑完一轮在等用户；静止状态下的可用输入框是空闲
+      return (prev === 'running' || prev === 'waiting') ? 'waiting' : 'idle';
+    }
+    return 'unknown';
+  }
+
+  // ---- 上报与调度 ----
+  function tick() {
+    var raw;
+    try { raw = classify(); } catch (e) { return; }
+    if (raw !== candidate) { candidate = raw; return; }
+    if (raw === 'unknown' || raw === prev) return;
+    prev = raw;
+    try { console.log('__ZPOCKET_STATE__' + JSON.stringify({ state: raw })); } catch (e) {}
+  }
+
+  var timer = null;
+  function schedule() {
+    if (timer !== null) return;
+    timer = setTimeout(function() { timer = null; tick(); }, 400);
+  }
+  try {
+    new MutationObserver(schedule).observe(
+      document.documentElement,
+      { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] }
+    );
+  } catch (e) {}
+  setInterval(schedule, 4000);
+
+  // ---- 调试导出（菜单「复制状态探测」调用，复用上面的闭包）----
+  window.__zpocketTaskProbe = function() {
+    var c = composer(), o = overlay();
+    function html(el) {
+      if (!el) return null;
+      return String(el.innerHTML).replace(/\s+/g, ' ').slice(0, 600);
+    }
+    return {
+      prev: prev,
+      candidate: candidate,
+      title: document.title,
+      icons: collectIcons(document),
+      composer: c ? { icons: collectIcons(c), inputReady: inputReady(), html: html(c) } : null,
+      overlay: o ? { icons: collectIcons(o), html: html(o) } : null
+    };
+  };
+})()"""
+
+private fun injectTaskObserver(view: WebView) {
+    view.evaluateJavascript(TASK_OBSERVER_JS, null)
+}
+
+/**
  * 收集页面渲染诊断：扫描当前页面上"宽度过窄导致文字竖排"的元素，
  * 连同 WebView 内核版本和视口尺寸一起返回，供排查布局问题。
  *
@@ -812,6 +1036,31 @@ private const val DIAGNOSTIC_JS = """(function() {
     items: items
   };
 })()"""
+
+/**
+ * 任务状态观察脚本的上报前缀（须与 TASK_OBSERVER_JS 里 console.log 的字面前缀一致）。
+ */
+private const val STATE_REPORT_PREFIX = "__ZPOCKET_STATE__"
+
+/**
+ * 采集状态观察器当前的判定依据（可见图标、锚点容器结构），供官方页面改版后
+ * 调优 TASK_OBSERVER_JS 的信号表。观察脚本未运行时（页面尚未加载完成）给出提示。
+ */
+private const val STATE_PROBE_JS = """(function() {
+  if (!window.__zpocketTaskProbe) {
+    return { error: '观察脚本未运行（页面可能尚未加载完成）' };
+  }
+  return window.__zpocketTaskProbe();
+})()"""
+
+private fun collectStateProbe(webView: WebView, onReport: (String) -> Unit) {
+    webView.evaluateJavascript(STATE_PROBE_JS) { raw ->
+        val report = runCatching {
+            JSONObject(raw ?: return@runCatching "探测失败：页面未返回数据").toString(2)
+        }.getOrDefault("探测失败: ${raw?.take(200)}")
+        onReport(report.take(6000))
+    }
+}
 
 private fun openExternal(context: Context, url: Uri) {
     runCatching {

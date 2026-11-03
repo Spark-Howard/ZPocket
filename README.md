@@ -45,17 +45,33 @@ ZCode 官方手机远程是**云端中继**架构：电脑端和手机各自连�
 远程页右上角菜单：刷新页面 / 重新扫码 / 清除登录数据 / 删除连接记录。
 页面里触发的文件下载会交给系统下载管理器（保存到「下载」目录，自动带上登录态）。
 
+## 任务状态通知
+
+切到后台不用盯着屏幕：电脑端 ZCode **跑完任务、等你确认/回复、运行出错**时，
+手机会弹本地通知（点击回到会话），主页有开关可关。
+
+- 原理：向官方远程页注入观察脚本，从页面 DOM 识别会话状态
+  （idle/running/waiting/paused/completed/error）的迁移并上报原生侧；
+- 只在进入「等待/完成/出错」时提醒，APP 在前台时不打扰，
+  同类提醒 2 分钟内不重复；
+- 状态识别基于页面的语义容器类（`@container/composer` 等）和
+  lucide 图标字面类名等稳定信号，**官方页面改版可能导致识别失效**——
+  失效时静默不通知，不影响远程功能。此时可用远程页菜单的
+  「复制状态探测」导出当前页面结构，反馈后修正信号表。
+
 ## 项目结构
 
 ```
 app/src/main/java/com/zpocket/app/
 ├── MainActivity.kt          # 入口 + 主题 + 外部链接(VIEW intent)接入
+├── KeepAliveService.kt      # 远程页期间的前台保活服务
 ├── data/ConnectionStore.kt  # 连接历史存储（SharedPreferences + JSON）
 └── ui/
     ├── AppRoot.kt           # 三个页面间的导航
-    ├── HomeScreen.kt        # 主页：扫码入口 + 连接历史
+    ├── HomeScreen.kt        # 主页：扫码入口 + 连接历史 + 设置开关
     ├── ScannerScreen.kt     # 扫码页：CameraX 预览 + ZXing 离线识别 + 手电筒
-    ├── RemoteScreen.kt      # 远程页：WebView 壳（UA 伪装 Chrome、Cookie 持久、返回键、外链跳转）
+    ├── RemoteScreen.kt      # 远程页：WebView 壳（UA 伪装 Chrome、Cookie 持久、返回键、外链跳转、状态观察脚本注入）
+    ├── SessionNotifier.kt   # 任务状态通知（决策状态机 + 本地通知）
     └── AppIcons.kt          # 自绘矢量图标（避免引入超大 icons-extended 包）
 ```
 

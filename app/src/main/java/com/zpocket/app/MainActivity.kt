@@ -38,10 +38,30 @@ class MainActivity : ComponentActivity() {
         extractUrl(intent)?.let { incomingUrl.value = it }
     }
 
+    override fun onResume() {
+        super.onResume()
+        isForeground = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        isForeground = false
+    }
+
     private fun extractUrl(intent: Intent?): String? =
         intent?.takeIf { it.action == Intent.ACTION_VIEW }
             ?.data?.toString()
             ?.takeIf { RemoteUrl.isValid(it) }
+
+    companion object {
+        /**
+         * APP 是否前台（单 Activity，onResume/onPause 足够）。
+         * 任务状态通知只在后台时弹出——用户正看着远程页时通知是冗余的。
+         */
+        @Volatile
+        var isForeground: Boolean = false
+            private set
+    }
 }
 
 private val ZPocketColors = darkColorScheme(

@@ -51,10 +51,12 @@ fun HomeScreen(
     history: List<Connection>,
     autoConnect: Boolean,
     keepAlive: Boolean,
+    taskNotify: Boolean,
     currentVersion: String,
     checkingUpdate: Boolean,
     onAutoConnectChange: (Boolean) -> Unit,
     onKeepAliveChange: (Boolean) -> Unit,
+    onTaskNotifyChange: (Boolean) -> Unit,
     onCheckUpdate: () -> Unit,
     onScan: () -> Unit,
     onOpen: (Connection) -> Unit,
@@ -127,6 +129,22 @@ fun HomeScreen(
                     )
                 }
                 Switch(checked = keepAlive, onCheckedChange = onKeepAliveChange)
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("任务状态通知", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "任务完成、等待确认或出错时提醒我（需通知权限）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = taskNotify, onCheckedChange = onTaskNotifyChange)
             }
 
             Spacer(Modifier.height(8.dp))
