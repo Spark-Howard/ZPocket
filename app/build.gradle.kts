@@ -12,8 +12,8 @@ android {
         applicationId = "com.zpocket.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "1.5.0"
+        versionCode = 16
+        versionName = "1.6.0"
     }
 
     signingConfigs {
@@ -63,4 +63,6 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
 
     testImplementation("junit:junit:4.13.2")
+    // 单测用真 org.json 工件（APK 内由 Android 平台提供同名 API，不影响打包）
+    testImplementation("org.json:json:20240303")
 }

@@ -52,14 +52,18 @@ fun HomeScreen(
     autoConnect: Boolean,
     keepAlive: Boolean,
     taskNotify: Boolean,
+    offlineCache: Boolean,
+    offlineCounts: Map<String, Int>,
     currentVersion: String,
     checkingUpdate: Boolean,
     onAutoConnectChange: (Boolean) -> Unit,
     onKeepAliveChange: (Boolean) -> Unit,
     onTaskNotifyChange: (Boolean) -> Unit,
+    onOfflineCacheChange: (Boolean) -> Unit,
     onCheckUpdate: () -> Unit,
     onScan: () -> Unit,
     onOpen: (Connection) -> Unit,
+    onOpenOffline: (Connection) -> Unit,
     onDelete: (Connection) -> Unit,
 ) {
     var pendingDelete by remember { mutableStateOf<Connection?>(null) }
@@ -148,6 +152,22 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("离线消息缓存", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "连接时自动保存浏览过的会话，断网也能回看",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = offlineCache, onCheckedChange = onOfflineCacheChange)
+            }
+
+            Spacer(Modifier.height(8.dp))
 
             Row(
                 Modifier.fillMaxWidth(),
@@ -185,7 +205,9 @@ fun HomeScreen(
                         ConnectionCard(
                             connection = conn,
                             timeText = timeFormat.format(Date(conn.lastUsedAt)),
+                            cachedCount = offlineCounts[conn.id] ?: 0,
                             onClick = { onOpen(conn) },
+                            onOpenOffline = { onOpenOffline(conn) },
                             onDelete = { pendingDelete = conn },
                         )
                     }
@@ -219,7 +241,9 @@ fun HomeScreen(
 private fun ConnectionCard(
     connection: Connection,
     timeText: String,
+    cachedCount: Int,
     onClick: () -> Unit,
+    onOpenOffline: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Card(
@@ -254,6 +278,11 @@ private fun ConnectionCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+            }
+            if (cachedCount > 0) {
+                TextButton(onClick = onOpenOffline) {
+                    Text("离线消息", style = MaterialTheme.typography.labelLarge)
+                }
             }
             IconButton(onClick = onDelete) {
                 Icon(

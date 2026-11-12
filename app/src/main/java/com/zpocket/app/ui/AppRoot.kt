@@ -36,12 +36,16 @@ import androidx.core.content.ContextCompat
 import com.zpocket.app.KeepAliveService
 import com.zpocket.app.data.Connection
 import com.zpocket.app.data.ConnectionStore
+import com.zpocket.app.data.MessageCacheStore
 import kotlinx.coroutines.launch
 
 sealed interface Screen {
     data object Home : Screen
     data object Scanner : Screen
     data class Remote(val connection: Connection) : Screen
+    /** 离线消息：会话列表 / 转录详情（数据来自连接期间的自动捕获）。 */
+    data class OfflineList(val connection: Connection) : Screen
+    data class OfflineDetail(val connection: Connection, val sessionKey: String) : Screen
 }
 
 /** 首次进入的页面：开了自动重连且有历史记录时，直接进上次的远程界面。 */
@@ -60,12 +64,17 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val messageStore = remember { MessageCacheStore(context) }
+    var offlineCache by remember { mutableStateOf(messageStore.isOfflineCacheEnabled()) }
     val currentVersion = remember { UpdateChecker.currentVersion(context) }
     var update by remember { mutableStateOf<UpdateInfo?>(null) }
     var checking by remember { mutableStateOf(false) }
+    // 各连接的离线缓存会话数（连接卡片入口 + 远程页错误页入口的显隐）
+    var offlineCounts by remember { mutableStateOf(history.associate { it.id to messageStore.sessionCount(it.id) }) }
 
     fun refresh() {
         history = store.load()
+        offlineCounts = history.associate { it.id to messageStore.sessionCount(it.id) }
     }
 
     fun connect(url: String): Boolean {
@@ -159,6 +168,8 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
             autoConnect = autoConnect,
             keepAlive = keepAlive,
             taskNotify = taskNotify,
+            offlineCache = offlineCache,
+            offlineCounts = offlineCounts,
             currentVersion = currentVersion,
             checkingUpdate = checking,
             onAutoConnectChange = {
@@ -173,11 +184,17 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
                 taskNotify = it
                 store.setTaskNotifyEnabled(it)
             },
+            onOfflineCacheChange = {
+                offlineCache = it
+                messageStore.setOfflineCacheEnabled(it)
+            },
             onCheckUpdate = { checkUpdate(manual = true) },
             onScan = { screen = Screen.Scanner },
             onOpen = { connect(it.url) },
+            onOpenOffline = { screen = Screen.OfflineList(it) },
             onDelete = {
                 store.delete(it.id)
+                messageStore.clearConnection(it.id)
                 refresh()
             },
         )
@@ -199,8 +216,36 @@ fun AppRoot(store: ConnectionStore, incomingUrl: MutableState<String?>) {
             onRescan = { screen = Screen.Scanner },
             onForget = {
                 store.delete(current.connection.id)
+                messageStore.clearConnection(current.connection.id)
                 refresh()
                 screen = Screen.Home
+            },
+            hasOfflineCache = (offlineCounts[current.connection.id] ?: 0) > 0,
+            onOpenOffline = {
+                refresh()
+                screen = Screen.OfflineList(current.connection)
+            },
+        )
+
+        is Screen.OfflineList -> OfflineMessagesScreen(
+            connection = current.connection,
+            store = messageStore,
+            onBack = {
+                refresh()
+                screen = Screen.Home
+            },
+            onOpenSession = { key ->
+                screen = Screen.OfflineDetail(current.connection, key)
+            },
+        )
+
+        is Screen.OfflineDetail -> OfflineTranscriptScreen(
+            connection = current.connection,
+            sessionKey = current.sessionKey,
+            store = messageStore,
+            onBack = {
+                refresh()
+                screen = Screen.OfflineList(current.connection)
             },
         )
     }

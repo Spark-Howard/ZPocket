@@ -79,6 +79,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.zpocket.app.data.Connection
+import com.zpocket.app.data.MessageCacheStore
+import com.zpocket.app.data.MessageReportAssembler
+import com.zpocket.app.data.OfflineMessageCache
 import org.json.JSONObject
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -88,6 +91,8 @@ fun RemoteScreen(
     onBack: () -> Unit,
     onRescan: () -> Unit,
     onForget: () -> Unit,
+    hasOfflineCache: Boolean = false,
+    onOpenOffline: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var progress by remember { mutableIntStateOf(100) }
@@ -105,9 +110,17 @@ fun RemoteScreen(
     var diagReport by remember { mutableStateOf<String?>(null) }
     // 状态探测报告（菜单"复制状态探测"生成，用于调优 TASK_OBSERVER_JS 的信号）
     var probeReport by remember { mutableStateOf<String?>(null) }
+    // 消息捕获探测报告（菜单"复制消息探测"生成，用于调优 MESSAGE_CAPTURE_JS 的定位）
+    var msgProbeReport by remember { mutableStateOf<String?>(null) }
 
     // 任务状态通知的决策状态机：与 WebView 同生命周期（重建 WebView 即重置基线）
     val sessionAlerts = remember(connection.url, webViewGeneration) { SessionAlertPolicy() }
+    // 离线消息快照的分块重组器：与 WebView 同生命周期
+    val messageAssembler = remember(connection.id, webViewGeneration) { MessageReportAssembler() }
+    // 离线缓存开关：关闭时不注入捕获脚本，省去页面侧 DOM 遍历与上报开销
+    val captureEnabled = remember(connection.url) {
+        MessageCacheStore(context).isOfflineCacheEnabled()
+    }
 
     // 网页文件上传（<input type=file>）：把选择结果回传给页面
     var pendingFileChooser by remember {
@@ -232,6 +245,7 @@ fun RemoteScreen(
                     injectCompatCss(view)
                     injectTouchReorder(view)
                     injectTaskObserver(view)
+                    if (captureEnabled) injectMessageCapture(view)
                 }
 
                 // SPA 路由切换也会触发，保证注入始终存在
@@ -239,6 +253,7 @@ fun RemoteScreen(
                     injectCompatCss(view)
                     injectTouchReorder(view)
                     injectTaskObserver(view)
+                    if (captureEnabled) injectMessageCapture(view)
                 }
 
                 // 主框架加载失败（DNS/断网等）：显示原生重试页，替代难看的系统错误页
@@ -274,20 +289,31 @@ fun RemoteScreen(
                     progress = newProgress
                 }
 
-                // 任务状态观察脚本（TASK_OBSERVER_JS）经 console 上报状态迁移，
-                // 这里解析后交给 SessionNotifier 决定是否弹本地通知。
+                // 注入脚本（任务状态观察 / 消息捕获）经 console 上报数据，
+                // 这里按前缀分发：状态迁移交给 SessionNotifier 决定是否弹本地通知，
+                // 消息快照分块交给重组器，收齐后落离线缓存。
                 // 不用 addJavascriptInterface：console 桥不向页面暴露任何对象，
                 // 且 JSON 内容按不可信数据处理（解析失败静默丢弃）。
                 override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                    val message = consoleMessage?.message()
-                    if (message == null || !message.startsWith(STATE_REPORT_PREFIX)) {
-                        return super.onConsoleMessage(consoleMessage)
-                    }
-                    val state = runCatching {
-                        JSONObject(message.removePrefix(STATE_REPORT_PREFIX)).optString("state")
-                    }.getOrNull()
-                    if (!state.isNullOrEmpty()) {
-                        SessionNotifier.handleStateReport(context, connection.name, sessionAlerts, state)
+                    val message = consoleMessage?.message() ?: return super.onConsoleMessage(consoleMessage)
+                    when {
+                        message.startsWith(STATE_REPORT_PREFIX) -> {
+                            val state = runCatching {
+                                JSONObject(message.removePrefix(STATE_REPORT_PREFIX)).optString("state")
+                            }.getOrNull()
+                            if (!state.isNullOrEmpty()) {
+                                SessionNotifier.handleStateReport(context, connection.name, sessionAlerts, state)
+                            }
+                        }
+
+                        message.startsWith(MSG_REPORT_PREFIX) -> {
+                            val snapshot = messageAssembler.feed(message.removePrefix(MSG_REPORT_PREFIX))
+                            if (snapshot != null) {
+                                OfflineMessageCache.handleSnapshot(context, connection.id, snapshot)
+                            }
+                        }
+
+                        else -> return super.onConsoleMessage(consoleMessage)
                     }
                     return true
                 }
@@ -479,6 +505,22 @@ fun RemoteScreen(
                                 },
                             )
                             DropdownMenuItem(
+                                text = { Text("复制消息探测") },
+                                onClick = {
+                                    menuOpen = false
+                                    collectMessageProbe(webView) { msgProbeReport = it }
+                                },
+                            )
+                            if (hasOfflineCache) {
+                                DropdownMenuItem(
+                                    text = { Text("离线消息") },
+                                    onClick = {
+                                        menuOpen = false
+                                        onOpenOffline()
+                                    },
+                                )
+                            }
+                            DropdownMenuItem(
                                 text = { Text("重新扫码") },
                                 onClick = {
                                     menuOpen = false
@@ -545,6 +587,12 @@ fun RemoteScreen(
                             color = MaterialTheme.colorScheme.outline,
                             textAlign = TextAlign.Center,
                         )
+                        if (hasOfflineCache) {
+                            Spacer(Modifier.height(20.dp))
+                            Button(onClick = onOpenOffline) {
+                                Text("查看离线消息")
+                            }
+                        }
                         Spacer(Modifier.height(28.dp))
                         Button(onClick = {
                             loadError = null
@@ -656,6 +704,36 @@ fun RemoteScreen(
             },
             dismissButton = {
                 TextButton(onClick = { probeReport = null }) { Text("关闭") }
+            },
+        )
+    }
+
+    msgProbeReport?.let { report ->
+        AlertDialog(
+            onDismissRequest = { msgProbeReport = null },
+            title = { Text("消息探测") },
+            text = {
+                Column(
+                    Modifier
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        report,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                        ClipData.newPlainText("zpocket-msg-probe", report)
+                    )
+                    Toast.makeText(context, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                }) { Text("复制") }
+            },
+            dismissButton = {
+                TextButton(onClick = { msgProbeReport = null }) { Text("关闭") }
             },
         )
     }
@@ -1055,6 +1133,371 @@ private const val STATE_PROBE_JS = """(function() {
 
 private fun collectStateProbe(webView: WebView, onReport: (String) -> Unit) {
     webView.evaluateJavascript(STATE_PROBE_JS) { raw ->
+        val report = runCatching {
+            JSONObject(raw ?: return@runCatching "探测失败：页面未返回数据").toString(2)
+        }.getOrDefault("探测失败: ${raw?.take(200)}")
+        onReport(report.take(6000))
+    }
+}
+
+/**
+ * 会话消息捕获器：把当前打开会话的内容序列化为结构化 JSON 上报，供离线查看。
+ *
+ * 背景：官方远程页是云端中继架构，消息只存在于页面 DOM 里，手机断网后无从查看。
+ * 思路与 TASK_OBSERVER_JS 一致——不碰官方 API，从 DOM 侧用稳定信号启发式提取；
+ * 提取失败时静默不缓存，不影响远程会话本身。
+ *
+ * 定位启发式（官方页无消息列表专用语义类，只能结构化推断）：
+ * - 以 @container/composer（输入区）为锚点向上爬，找到第一个「高度可观且在其
+ *   子树内（composer 之外）包含足量文本」的祖先，即会话主区；
+ * - 从该祖先向下钻：每层若只有一个"有文本"的子元素就继续深入，出现多个文本
+ *   子元素且无绝对主导者（≥90% 文本占比）时，该层级即消息列表；某子元素占比
+ *   绝对主导时视为单链噪音（角标/时间戳）继续深入；
+ * - 过滤误判：所有消息块的最大文本段 < 40 字时不缓存（工作区会话列表每行都是
+ *   短标题，以此与真实会话区分）。
+ *
+ * 序列化：保持 DOM 顺序递归遍历，PRE/独立 CODE → code 段（语言取 language-* 类），
+ * IMG → img 段（过滤 lucide 小图标与 <24px 元素；blob: src 异步转 dataURL 后
+ * 下轮快照生效），其余归并为 text 段（块级标签间补换行）。角色按消息块及其
+ * 3 层祖先的类名启发式分类 user/assistant/chat。
+ *
+ * 上报：快照 JSON 按 ≤24KB 切成 {sid,i,n,part} 分块逐条 console.log，由原生
+ * onConsoleMessage 按 MSG_REPORT_PREFIX 前缀接收重组。快照指纹（标题+条数+
+ * 总长+首尾摘要）未变化时跳过上报。MutationObserver（800ms 防抖）保实时性，
+ * 10 秒轮询兜底；进程常驻依赖后台保活前台服务（同任务状态观察）。
+ *
+ * 已知限制：官方页面只渲染当前打开的会话，且图片懒加载——只能缓存打开浏览过的
+ * 会话与滚动加载过的图片。调优：菜单「复制消息探测」导出定位依据，据此修正
+ * 下方启发式。
+ */
+private const val MESSAGE_CAPTURE_JS = """(function(){
+  'use strict';
+  if (window.__zpocketMessageCapture) return;
+  window.__zpocketMessageCapture = true;
+
+  // ---- 参数（与原生 OfflineCachePolicy 的上限对应）----
+  var MAX_MSGS = 200, MAX_SEG_CHARS = 6000, CHUNK = 24000;
+  var MAX_SEGS = 20, MAX_MSG_CHARS = 12000;
+  var DEBOUNCE = 800, INTERVAL = 10000;
+  var MIN_ROOT_TEXT = 400, MIN_ROOT_H = 300, MIN_LONG_TEXT = 40;
+  var MAX_BLOB_JOBS = 10, MAX_DATA_REF = 500000;
+
+  var SID = Math.random().toString(36).slice(2, 8);
+  var seq = 0;
+  var lastFp = '';
+  var blobCache = {};   // blob:src -> dataURL（异步转换完成后下一轮快照生效）
+  var converting = {};  // 转换中的 blob:src，防重复 fetch；大小即在途预算
+
+  var SKIP_TAGS = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, SVG: 1, NAV: 1, HEADER: 1, FOOTER: 1, BUTTON: 1, INPUT: 1, TEXTAREA: 1 };
+
+  function composer() { return document.querySelector('[class*="@container/composer"]'); }
+
+  // root 子树内（排除 exclude 子树与脚本样式标签）的可见文本量
+  function textLen(root, exclude) {
+    var total = 0;
+    try {
+      var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode: function (node) {
+          var p = node.parentElement;
+          while (p && p !== root) {
+            if (p === exclude) return NodeFilter.FILTER_REJECT;
+            var t = p.tagName;
+            if (t === 'SCRIPT' || t === 'STYLE' || t === 'NOSCRIPT' || t === 'SVG') return NodeFilter.FILTER_REJECT;
+            p = p.parentElement;
+          }
+          return (node.nodeValue || '').trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
+      });
+      while (w.nextNode()) total += w.currentNode.nodeValue.trim().length;
+    } catch (e) {}
+    return total;
+  }
+  function textContentLen(el) {
+    try { return (el.textContent || '').trim().length; } catch (e) { return 0; }
+  }
+
+  // ---- 定位：转录区根 + 消息块列表 ----
+  function transcriptRoot(c) {
+    var el = c;
+    while (el && el !== document.body) {
+      var p = el.parentElement;
+      if (!p) return null;
+      if (p.clientHeight >= MIN_ROOT_H && textLen(p, c) >= MIN_ROOT_TEXT) return p;
+      el = p;
+    }
+    return null;
+  }
+  function textKids(el, exclude) {
+    var kids = [];
+    var ch = el.children;
+    for (var i = 0; i < ch.length; i++) {
+      var k = ch[i];
+      if (k === exclude || k.contains(exclude)) continue;
+      if (SKIP_TAGS[k.tagName]) continue;
+      if (textContentLen(k) > 0) kids.push(k);
+    }
+    return kids;
+  }
+  function findBlocks(root, exclude) {
+    var cur = root;
+    for (var guard = 0; guard < 12; guard++) {
+      var kids = textKids(cur, exclude);
+      if (kids.length === 0) return [];
+      if (kids.length === 1) { cur = kids[0]; continue; }
+      var lens = [], total = 0, maxIdx = 0;
+      for (var i = 0; i < kids.length; i++) {
+        var n = textContentLen(kids[i]);
+        lens.push(n);
+        total += n;
+        if (n > lens[maxIdx]) maxIdx = i;
+      }
+      // 一个子元素占据绝对主导文本、其余是零星噪音：视为单链继续深入
+      if (total > 0 && lens[maxIdx] >= total * 0.9 && lens[maxIdx] >= MIN_ROOT_TEXT) {
+        cur = kids[maxIdx];
+        continue;
+      }
+      return kids;
+    }
+    return [];
+  }
+
+  function roleOf(el) {
+    var cls = '';
+    var e = el;
+    for (var i = 0; i < 3 && e; i++) {
+      cls += ' ' + (e.getAttribute ? (e.getAttribute('class') || '') : '');
+      e = e.parentElement;
+    }
+    if (/user|human/i.test(cls)) return 'user';
+    if (/assistant|agent|bot|zcode/i.test(cls)) return 'assistant';
+    return 'chat';
+  }
+
+  // ---- 序列化：消息块 → 分段 JSON ----
+  function segsOf(block) {
+    var segs = [];
+    var buf = '';
+    function flush() {
+      var t = buf.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      if (t) segs.push({ t: 'text', v: t.slice(0, MAX_SEG_CHARS) });
+      buf = '';
+    }
+    function pushCode(pre) {
+      var codeEl = pre.querySelector('code') || pre;
+      var text = (codeEl.innerText || codeEl.textContent || '').replace(/\n{3,}/g, '\n\n');
+      if (!text.trim()) return;
+      var cls = (codeEl.getAttribute('class') || '') + ' ' + (pre.getAttribute('class') || '');
+      var m = cls.match(/language-([\w#+.-]+)/) || cls.match(/hljs[\s-]([\w#+.-]+)/);
+      flush();
+      segs.push({ t: 'code', v: text.slice(0, MAX_SEG_CHARS), lang: m ? m[1] : '' });
+    }
+    function pushImg(img) {
+      // currentSrc 反映实际选择的资源（srcset/懒加载语义正确），
+      // 属性 src 可能是懒加载占位图
+      var src = img.currentSrc || img.getAttribute('src') || '';
+      if (!src) return;
+      var cls = img.getAttribute('class') || '';
+      if (/lucide|icon/i.test(cls)) return;
+      // 1~2px 的占位图（真实尺寸撑布局）直接跳过
+      if (img.naturalWidth > 0 && img.naturalWidth <= 2) return;
+      var r = img.getBoundingClientRect();
+      var w = Math.round(r.width) || img.naturalWidth || 0;
+      var h = Math.round(r.height) || img.naturalHeight || 0;
+      if ((w && w < 24) || (h && h < 24)) return;
+      if (src.indexOf('data:') === 0) {
+        if (src.length <= MAX_DATA_REF) segs.push({ t: 'img', ref: src, w: w, h: h });
+      } else if (src.indexOf('blob:') === 0) {
+        if (blobCache[src]) segs.push({ t: 'img', ref: blobCache[src], w: w, h: h });
+        else convertBlob(src);
+      } else if (src.indexOf('http') === 0) {
+        segs.push({ t: 'img', ref: src.slice(0, 2000), w: w, h: h });
+      }
+    }
+    function walk(node, inPre) {
+      if (node.nodeType === 3) {
+        var v = node.nodeValue || '';
+        if (v) buf += inPre ? v : v.replace(/\s+/g, ' ');
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      var tag = node.tagName;
+      if (SKIP_TAGS[tag]) return;
+      if (tag === 'BR') { buf += '\n'; return; }
+      if (tag === 'PRE') { flush(); pushCode(node); return; }
+      if (tag === 'IMG') { pushImg(node); return; }
+      var kids = node.childNodes;
+      for (var i = 0; i < kids.length; i++) walk(kids[i], inPre);
+      if (/^(DIV|P|LI|UL|OL|TABLE|TR|BLOCKQUOTE|H[1-6]|SECTION|ARTICLE|FIGURE|HR)$/.test(tag) &&
+          buf && buf.slice(-1) !== '\n') {
+        buf += '\n';
+      }
+    }
+    try { walk(block, false); } catch (e) {}
+    flush();
+    return segs;
+  }
+
+  function convertBlob(src) {
+    var busy = 0;
+    for (var k in converting) busy++;
+    if (busy >= MAX_BLOB_JOBS || converting[src]) return;
+    converting[src] = true;
+    fetch(src).then(function (r) { return r.blob(); }).then(function (b) {
+      var fr = new FileReader();
+      fr.onload = function () {
+        delete converting[src];
+        if (fr.result && fr.result.length <= MAX_DATA_REF) blobCache[src] = fr.result;
+        schedule(); // 转换完成：下一轮快照带上图片字节
+      };
+      fr.onerror = function () { delete converting[src]; };
+      fr.readAsDataURL(b);
+    }).catch(function () { delete converting[src]; });
+  }
+
+  function pageTitle() {
+    var t = String(document.title || '').trim();
+    t = t.replace(/[-–—|]\s*ZCode.*$/i, '').trim();
+    return t;
+  }
+
+  // 单消息上限：段数与总字符双截断（与原生 capMessage 同语义，保证快照有界）
+  function trimSegs(segs) {
+    var out = [], total = 0;
+    for (var i = 0; i < segs.length && out.length < MAX_SEGS; i++) {
+      var s = segs[i];
+      var len = (s.v || '').length;
+      if (total + len > MAX_MSG_CHARS) break;
+      out.push(s);
+      total += len;
+    }
+    return out;
+  }
+
+  function buildSnapshot() {
+    var c = composer();
+    if (!c) return null;
+    var root = transcriptRoot(c);
+    if (!root) return null;
+    var blocks = findBlocks(root, c);
+    var messages = [];
+    var longest = 0;
+    for (var i = 0; i < blocks.length && messages.length < MAX_MSGS; i++) {
+      var segs = trimSegs(segsOf(blocks[i]));
+      for (var j = 0; j < segs.length; j++) {
+        var v = segs[j].v;
+        if (v && v.length > longest) longest = v.length;
+      }
+      if (segs.length) messages.push({ role: roleOf(blocks[i]), segs: segs });
+    }
+    // 全是短文本块：疑似工作区会话列表而非会话内容，不缓存
+    if (!messages.length || longest < MIN_LONG_TEXT) return null;
+    return { title: pageTitle(), messages: messages };
+  }
+
+  // ---- 上报与调度 ----
+  function hash(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36);
+  }
+  function fingerprint(snap) {
+    var total = 0;
+    for (var i = 0; i < snap.messages.length; i++) {
+      var segs = snap.messages[i].segs;
+      for (var j = 0; j < segs.length; j++) total += (segs[j].v || '').length;
+    }
+    var first = snap.messages[0], last = snap.messages[snap.messages.length - 1];
+    return [snap.title, snap.messages.length, total,
+      hash(JSON.stringify(first.segs).slice(0, 400)),
+      hash(JSON.stringify(last.segs).slice(0, 400))].join('|');
+  }
+  function send(snap) {
+    var json = JSON.stringify(snap);
+    var n = Math.max(1, Math.ceil(json.length / CHUNK));
+    var sid = SID + '-' + (++seq);
+    for (var i = 0; i < n; i++) {
+      console.log('__ZPOCKET_MSGS__' + JSON.stringify({
+        sid: sid, i: i, n: n, part: json.slice(i * CHUNK, (i + 1) * CHUNK)
+      }));
+    }
+  }
+  function tick() {
+    var snap;
+    try { snap = buildSnapshot(); } catch (e) { return; }
+    if (!snap) return;
+    var fp;
+    try { fp = fingerprint(snap); } catch (e) { return; }
+    if (fp === lastFp) return;
+    lastFp = fp;
+    send(snap);
+  }
+  var timer = null;
+  function schedule() {
+    if (timer !== null) return;
+    timer = setTimeout(function () { timer = null; tick(); }, DEBOUNCE);
+  }
+  try {
+    new MutationObserver(schedule).observe(
+      document.documentElement,
+      { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] }
+    );
+  } catch (e) {}
+  setInterval(schedule, INTERVAL);
+
+  // ---- 调试导出（菜单「复制消息探测」调用，复用上面的闭包）----
+  window.__zpocketMessageProbe = function () {
+    var c = composer();
+    var root = c ? transcriptRoot(c) : null;
+    var blocks = root ? findBlocks(root, c) : [];
+    function path(el) {
+      var parts = [];
+      var e = el;
+      for (var i = 0; e && i < 5; i++, e = e.parentElement) {
+        var cls = String(e.getAttribute('class') || '').trim();
+        parts.push(e.tagName.toLowerCase() + (cls ? '.' + cls.split(/\s+/).slice(0, 3).join('.') : ''));
+      }
+      return parts.join(' > ');
+    }
+    return {
+      composerFound: !!c,
+      rootFound: !!root,
+      title: document.title,
+      blockCount: blocks.length,
+      roles: blocks.slice(0, 12).map(roleOf),
+      samples: blocks.slice(0, 3).map(function (b) {
+        return {
+          tag: b.tagName,
+          cls: String(b.getAttribute('class') || '').slice(0, 140),
+          text: (b.innerText || '').replace(/\s+/g, ' ').slice(0, 80)
+        };
+      }),
+      rootPath: root ? path(root) : null
+    };
+  };
+})()"""
+
+/**
+ * 消息捕获脚本的上报前缀（须与 MESSAGE_CAPTURE_JS 里 console.log 的字面前缀一致）。
+ */
+private const val MSG_REPORT_PREFIX = "__ZPOCKET_MSGS__"
+
+private fun injectMessageCapture(view: WebView) {
+    view.evaluateJavascript(MESSAGE_CAPTURE_JS, null)
+}
+
+/**
+ * 采集消息捕获脚本当前的定位依据（转录区祖先链、消息块样本），供官方页面改版后
+ * 调优 MESSAGE_CAPTURE_JS 的启发式。捕获脚本未运行时（页面尚未加载完成）给出提示。
+ */
+private const val MESSAGE_PROBE_JS = """(function() {
+  if (!window.__zpocketMessageProbe) {
+    return { error: '捕获脚本未运行（页面可能尚未加载完成）' };
+  }
+  return window.__zpocketMessageProbe();
+})()"""
+
+private fun collectMessageProbe(webView: WebView, onReport: (String) -> Unit) {
+    webView.evaluateJavascript(MESSAGE_PROBE_JS) { raw ->
         val report = runCatching {
             JSONObject(raw ?: return@runCatching "探测失败：页面未返回数据").toString(2)
         }.getOrDefault("探测失败: ${raw?.take(200)}")
